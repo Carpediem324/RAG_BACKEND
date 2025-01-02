@@ -8,14 +8,14 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from serpapi import GoogleSearch
 
-# LangChain, Upstage, Chroma 관련
+# LangChain 관련
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 
-# ▶ 추가된 부분
+# Chroma, UpstageEmbeddings
 from langchain_chroma import Chroma
 from langchain_upstage import ChatUpstage, UpstageEmbeddings
 
@@ -26,13 +26,12 @@ app = FastAPI()
 # Allow CORS for local dev
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict this to your domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# API keys configuration
 UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 SERP_API_KEY = os.getenv("SERP_API_KEY")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID")
@@ -45,26 +44,26 @@ if not SERP_API_KEY:
     raise EnvironmentError("SERP_API_KEY is not set in the environment.")
 
 if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
-    raise EnvironmentError("NAVER_CLIENT_ID or NAVER_CLIENT_SECRET is not set in the environment.")
+    raise EnvironmentError("NAVER_CLIENT_ID or NAVER_CLIENT_SECRET is not set.")
 
-# LLM 초기화
 chat_upstage = ChatUpstage(api_key=UPSTAGE_API_KEY)
 
 class MessageRequest(BaseModel):
     message: str
 
-# 1) 네이버 검색어 추출
+# (1) 네이버 검색어 추출
 async def extract_keywords(message: str):
     naver_template = (
         "Extract the most relevant single keyword from the following question "
-        "to use in a search query:\n\nQuestion: {question}\nKeyword:"
+        "to use in a search query:\n\n"
+        "Question: {question}\nKeyword:"
     )
     prompt = ChatPromptTemplate.from_template(naver_template)
     chain = prompt | chat_upstage | StrOutputParser()
     keyword = chain.invoke({"question": message})
     return keyword.strip()
 
-# 2) 구글 검색어 리파인
+# (2) 구글 검색 질의 확장
 async def refine_query_for_google(message: str):
     google_template = (
         "Refine the following question to make it suitable for a web search query:\n\n"
@@ -75,7 +74,7 @@ async def refine_query_for_google(message: str):
     refined_query = chain.invoke({"question": message})
     return refined_query.strip()
 
-# 3) 네이버 검색
+# (3) 네이버 뉴스 검색 (description 필드 활용)
 async def search_naver(query: str):
     enc_text = urllib.parse.quote(query)
     url = f"https://openapi.naver.com/v1/search/news.json?query={enc_text}"
@@ -84,23 +83,30 @@ async def search_naver(query: str):
     request.add_header("X-Naver-Client-Secret", NAVER_CLIENT_SECRET)
     try:
         response = urllib.request.urlopen(request)
-        rescode = response.getcode()
-        if rescode == 200:
-            response_body = response.read().decode("utf-8")
-            data = json.loads(response_body)
+        if response.getcode() == 200:
+            data = json.loads(response.read().decode("utf-8"))
             items = data.get("items", [])
-            results = [
-                {"title": item["title"], "link": item["link"]}
-                for item in items if "title" in item and "link" in item
-            ]
+            results = []
+            for item in items:
+                # title, originallink, description, pubDate, link 등
+                title = item.get("title", "")
+                link = item.get("link", "")
+                desc = item.get("description", "")
+                # 필요하다면 HTML 태그 제거 로직을 넣어도 됨
+                # ex) re.sub(r'<[^>]+>', '', desc)
+                results.append({
+                    "title": title,
+                    "link": link,
+                    "description": desc
+                })
             return results
         else:
             return []
     except Exception as e:
-        print(f"Error occurred: {e}")
+        print(f"Error in Naver search: {e}")
         return []
 
-# 4) 구글 검색
+# (4) 구글 검색
 async def search_google(query: str):
     params = {
         "engine": "google",
@@ -109,72 +115,96 @@ async def search_google(query: str):
         "api_key": SERP_API_KEY
     }
     search = GoogleSearch(params)
-    results = search.get_dict().get("organic_results", [])
+    data = search.get_dict()
+    results = data.get("organic_results", [])
     return [
-        {"title": result.get("title"), "link": result.get("link")}
-        for result in results
+        {
+            "title": r.get("title", ""),
+            "link": r.get("link", ""),
+            "description": r.get("snippet", "")  # 구글은 snippet으로 간단한 요약을 제공
+        }
+        for r in results
     ]
 
 @app.post("/chat")
 async def chat_endpoint(req: MessageRequest):
-    # Step 1. 네이버 검색을 위한 단일 키워드 추출
+    # 1) 네이버용 키워드 추출
     naver_keyword = await extract_keywords(req.message)
 
-    # Step 2. 네이버 뉴스 검색
+    # 2) 네이버 뉴스 검색
     naver_results = await search_naver(naver_keyword)
     source = "Naver Search API"
 
-    # Step 3. 네이버 검색 결과가 없다면 구글 검색
+    # 3) 네이버 결과가 없으면 구글 검색
     if not naver_results:
         google_query = await refine_query_for_google(req.message)
         naver_results = await search_google(google_query)
         source = "Google Search API"
 
-    # 아무 검색결과도 없을 때
     if not naver_results:
         return {"reply": "No results found from both Naver and Google.", "source": "None"}
 
-    # ----------------------------------------------------------
-    # ★★★ 여기가 핵심: 검색 결과 → 벡터스토어(Chroma) → top-k 추출
-    # ----------------------------------------------------------
+    # ---------------------------------------------------------
+    # description 필드 → 문서화 → chunking → 벡터스토어
+    # ---------------------------------------------------------
+    from langchain.docstore.document import Document
 
-    # (1) 검색 결과를 Document 형식으로 변환
-    #     LangChain의 Document(page_content=..., metadata=...)를 사용하는 것이 일반적
     documents = []
     for item in naver_results:
-        content = f"{item['title']}\n{item['link']}"
-        documents.append(Document(page_content=content))
+        # 실제 임베딩될 컨텐츠는 description
+        # title, link는 메타데이터에 넣어두면 결과에서 확인 가능
+        desc = item["description"]
+        title = item["title"]
+        link = item["link"]
 
-    # (2) 문서를 Chunking - 제목/링크 뿐이라 짧을 수 있지만 실제 본문이 있다고 가정
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=300,
-        chunk_overlap=50
-    )
-    doc_splits = text_splitter.split_documents(documents)
+        doc = Document(
+            page_content=desc,
+            metadata={
+                "title": title,
+                "link": link
+            }
+        )
+        documents.append(doc)
 
-    # (3) 임베딩 생성 (UpstageEmbeddings 사용)
+    # 문서 분할
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    split_docs = splitter.split_documents(documents)
+
+    # 임베딩 생성 (UpstageEmbeddings)
     embeddings = UpstageEmbeddings(model="embedding-query", api_key=UPSTAGE_API_KEY)
 
-    # (4) Chroma 벡터스토어 생성
-    chroma_db = Chroma.from_documents(doc_splits, embedding=embeddings)
+    # Chroma DB 구성
+    vectorstore = Chroma.from_documents(split_docs, embedding=embeddings)
 
-    # (5) Retriever 객체를 통해 top-k 추출
-    retriever = chroma_db.as_retriever(
-        search_type="mmr",  # or similarity
-        search_kwargs={"k": 3}
-    )
+    # top-k 문서 검색
+    retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k":3})
     relevant_docs = retriever.get_relevant_documents(req.message)
 
-    # (6) 최종 context로 사용할 문자열 생성
-    context = "\n\n".join([doc.page_content for doc in relevant_docs])
-    # ----------------------------------------------------------
+    # 이제 RAG를 위해 context 생성
+    # description을 벡터화했으나, 답변을 구성할 때 title/link를 포함할 수도 있음
+    # 여기서는 단순히 description만 context로 합친 예시
+    context = ""
+    for d in relevant_docs:
+        # d.page_content == description
+        # d.metadata["title"], d.metadata["link"]
+        context += f"Title: {d.metadata.get('title')}\n"
+        context += f"Link: {d.metadata.get('link')}\n"
+        context += f"Description: {d.page_content}\n\n"
 
-    # Step 4. RAG 파이프라인으로 답변 생성
-    template = """Answer the question based on context.
+    # RAG 파이프라인
+    template = """You are a friendly and knowledgeable AI assistant that helps answer user questions using real-time news information. 
+
+    - Use the provided 'Context' (top-k search results) to find relevant details. 
+    - If the context doesn't contain enough information or you're unsure, express that politely.
+    - Always explain in a clear, conversational style.
 
     Question: {question}
-    Context: {context}
-    Answer:"""
+
+    Context:
+    {context}
+
+    Now provide a helpful, concise, and chatty answer to the user's question:
+    """
 
     prompt = ChatPromptTemplate.from_template(template)
     chain = (
@@ -185,17 +215,18 @@ async def chat_endpoint(req: MessageRequest):
     )
     result = chain.invoke({"question": req.message, "context": context})
 
-    # ":" 이후를 자르는 간단 파싱
-    result = result.split(":")[1].strip() if ":" in result else result.strip()
+    # 간단 파싱
+    if ":" in result:
+        result = result.split(":")[-1].strip()
 
-    # 반환
     return {
         "reply": result,
         "source": source,
         "results": [
             {
-                "title": d.page_content.split("\n")[0],
-                "link": d.page_content.split("\n")[1] if "\n" in d.page_content else ""
+                "title": d.metadata.get("title", ""),
+                "link": d.metadata.get("link", ""),
+                "description": d.page_content
             }
             for d in relevant_docs
         ]
