@@ -1,6 +1,7 @@
 import os
 import urllib.request
 import urllib.parse
+import json
 from fastapi import FastAPI
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -46,6 +47,22 @@ chat_upstage = ChatUpstage()
 class MessageRequest(BaseModel):
     message: str
 
+async def extract_keywords(message: str):
+    # Use LLM to extract keywords for Naver
+    naver_template = "Extract the most relevant single keyword from the following question to use in a search query:\n\nQuestion: {question}\nKeyword:"
+    prompt = ChatPromptTemplate.from_template(naver_template)
+    chain = prompt | chat_upstage | StrOutputParser()
+    keyword = chain.invoke({"question": message})
+    return keyword.strip()
+
+async def refine_query_for_google(message: str):
+    # Use LLM to create a more descriptive query for Google
+    google_template = "Refine the following question to make it suitable for a web search query:\n\nQuestion: {question}\nRefined Query:"
+    prompt = ChatPromptTemplate.from_template(google_template)
+    chain = prompt | chat_upstage | StrOutputParser()
+    refined_query = chain.invoke({"question": message})
+    return refined_query.strip()
+
 async def search_naver(query: str):
     enc_text = urllib.parse.quote(query)
     url = f"https://openapi.naver.com/v1/search/news.json?query={enc_text}"
@@ -57,11 +74,18 @@ async def search_naver(query: str):
         rescode = response.getcode()
         if rescode == 200:
             response_body = response.read().decode('utf-8')
-            return response_body  # Return raw JSON
+            data = json.loads(response_body)
+            items = data.get("items", [])
+            results = [
+                {"title": item["title"], "link": item["link"]} 
+                for item in items if "title" in item and "link" in item
+            ]
+            return results
         else:
-            return None
-    except Exception:
-        return None
+            return []
+    except Exception as e:
+        print(f"Error occurred: {e}")
+        return []
 
 async def search_google(query: str):
     params = {
@@ -71,63 +95,47 @@ async def search_google(query: str):
         "api_key": SERP_API_KEY
     }
     search = GoogleSearch(params)
-    return search.get_dict()
+    results = search.get_dict().get("organic_results", [])
+    return [
+        {"title": result.get("title"), "link": result.get("link")}
+        for result in results
+    ]
 
 @app.post("/chat")
 async def chat_endpoint(req: MessageRequest):
-    # Step 1: Try Naver Search
-    naver_result = await search_naver(req.message)
-    urls = []
+    # Step 1: 네이버 검색을 위한 단어 키워드 추출
+    naver_keyword = await extract_keywords(req.message)
 
-    if naver_result:
-        import json
-        naver_data = json.loads(naver_result)
-        if 'items' in naver_data:
-            urls = [item['link'] for item in naver_data['items']]
+    # Step 2: 네이버 검색 시도도
+    naver_results = await search_naver(naver_keyword)
+    source = "Naver Search API"
 
-    # Step 2: Fallback to Google Search if no Naver result
-    if not urls:
-        google_result = await search_google(req.message)
-        urls = [result['link'] for result in google_result.get('organic_results', [])]
+    # Step 3: 네이버 검색 결과가 없다면 구글 검색 시도도
+    if not naver_results:
+        # Step 3-1: 구글 검색을 위해 질문 재정의의
+        google_query = await refine_query_for_google(req.message)
+        naver_results = await search_google(google_query)
+        source = "Google Search API"
 
-    if not urls:
-        return {"reply": "No results found from both Naver and Google."}
+    if not naver_results: # 아무 검색 결과도 얻지 못했을 때 결과 없음 반환환
+        return {"reply": "No results found from both Naver and Google.", "source": "None"}
 
-    # Step 3: Load URLs and extract content
-    loader = UnstructuredURLLoader(urls=urls)
-    data = loader.load()
+    # Step 4: RAG파이프라인을 위한 context재정의의
+    context = "\n\n".join([f"{result['title']}\n{result['link']}" for result in naver_results])
 
-    # Step 4: LangChain setup for RAG
-    template = """Answer the question based on context.
-
-    Question: {question}
-    Context: {context}
-    Answer:"""
-
+    # Step 5: RAG를 이용한 답변 생성성
+    template = """Answer the question based on context.\n\nQuestion: {question}\nContext: {context}\nAnswer:"""
     prompt = ChatPromptTemplate.from_template(template)
-    parser = StrOutputParser()
-
     chain = (
         {"question": RunnablePassthrough(), "context": RunnablePassthrough()}
         | prompt
         | chat_upstage
-        | parser
+        | StrOutputParser()
     )
-
-    # Step 5: Split documents for efficient processing
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=200,
-        chunk_overlap=50
-    )
-    splits = text_splitter.split_documents(data)
-    docs = [doc.page_content for doc in splits]
-
-    # Step 6: Generate answer
-    context = "\n\n".join(docs)
     result = chain.invoke({"question": req.message, "context": context})
     result = result.split(":")[1].strip() if ":" in result else result.strip()
 
-    return {"reply": result}
+    return {"reply": result, "source": source, "results": naver_results}
 
 @app.get("/health")
 @app.get("/")
