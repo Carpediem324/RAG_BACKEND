@@ -200,8 +200,7 @@ async def chat_endpoint(req: MessageRequest):
 
     Question: {question}
 
-    Context:
-    {context}
+    Context: {context}
 
     Now provide a helpful, concise, and chatty answer to the user's question:
     """
